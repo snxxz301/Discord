@@ -1,0 +1,144 @@
+name: win 11 + tailscale + Discord + Portugues
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Configure System Language to Portuguese (PT-BR)
+        run: |
+          # Define o idioma do sistema, cultura e layout do teclado para PT-BR (ABNT2)
+          Set-WinSystemLocale -SystemLocale pt-BR
+          Set-WinUserLanguageList -LanguageList (New-WinUserLanguageList -Language pt-BR) -Force
+          Set-Culture pt-BR
+
+      - name: Configure Core RDP Settings
+        run: |
+          # Ativa a Área de Trabalho Remota e desativa o NLA
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                             -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                             -Name "SecurityLayer" -Value 0 -Force
+
+          # Remove regras duplicadas do Firewall e abre a porta 3389 para o RDP
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          # Reinicia o serviço de RDP para aplicar as alterações
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with Fixed Password
+        run: |
+          \$password = "MR.English2008"
+          securePass = ConvertTo-SecureString password -AsPlainText -Force
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password \$securePass -AccountNeverExpires
+          }
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+         
+          echo "RDP_CREDS=User: RDP | Password: password" >> env:GITHUB_ENV
+         
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Discord via Winget
+        run: |
+          # Força a atualização do gerenciador de pacotes e instala o Discord de forma silenciosa
+          winget source update
+          winget install --id Discord.Discord --exact --silent --accept-source-agreements --accept-package-agreements
+
+      - name: Install Tailscale
+        run: |
+          \$tsUrl = "https://tailscale.com"
+          installerPath = "env:TEMP\tailscale.msi"
+         
+          Invoke-WebRequest -Uri tsUrl -OutFile installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item \$installerPath -Force
+
+      - name: Establish Tailscale Connection
+        run: |
+          # Inicia o Tailscale injetando o seu secret e definindo o hostname dinâmico
+          & "\$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=\({{ secrets.TAILSCALE_AUTHKEY }} --hostname=gh-runner-\)env:GITHUB_RUN_ID --unattended
+         
+          # Aguarda o Tailscale atribuir o IP da rede
+          \$tsIP = \(null\)retries = 0
+          while (-not tsIP -and retries -lt 10) {
+              \(tsIP = & "\)env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              \$retries++
+          }
+         
+          if (-not \$tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=tsIP" >> env:GITHUB_ENV
+     
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: \$env:TAILSCALE_IP"
+         
+          # Testa a conexão TCP local na porta 3389 para certificar que o RDP está aberto
+          testResult = Test-NetConnection -ComputerName env:TAILSCALE_IP -Port 3389
+          if (-not \$testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
+
+      - name: Maintain Connection + Watch RDP User
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
+
+          \$rdpProfile = "C:\Users\RDP"
+          startupPath = "rdpProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup"
+          \$downloadUrl = "https://gitlab.com/MR.English2008/pcme_rdp/-/raw/main/Downloads.bat"
+          downloadPath = "startupPath\Downloads.bat"
+
+          # Aguarda o perfil do usuário RDP ser criado no primeiro login para injetar o script de inicialização
+          while (\$true) {
+              if (Test-Path \$rdpProfile) {
+                  try {
+                      if (-not (Test-Path \$startupPath)) {
+                          New-Item -ItemType Directory -Path \$startupPath -Force | Out-Null
+                      }
+
+                      Invoke-WebRequest -Uri downloadUrl -OutFile downloadPath -UseBasicParsing
+                      Write-Host "✅ Downloads.bat copied to \$downloadPath"
+
+                      # Executa o script .bat do GitLab pela primeira vez
+                      cmd /c \$downloadPath
+                      Write-Host "✅ Downloads.bat executed successfully"
+                      break
+                  }
+                  catch {
+                      Write-Host "❌ Error copying or executing Downloads.bat: (_.Exception.Message)"
+                      break
+                  }
+              }
+              else {
+                  Write-Host "[\$(Get-Date)] Waiting for RDP profile to be created... (Faca login via RDP para criar o perfil)"
+                  Start-Sleep -Seconds 30
+              }
+          }
+
+          # Mantém o Runner do GitHub Actions vivo por até 350 minutos
+          while (\$true) {
+              Write-Host "[\$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
